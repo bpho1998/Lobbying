@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
 NetFile SFO Lobbyist Filings Monitor
-Checks for new filings and sends Discord notifications.
-
-API docs: https://netfile.com/Connect2/api/json/metadata?op=FilingList
+Uses Playwright to render the SPA and scrape the filings table,
+then sends Discord notifications for new filings.
 """
 
 import json
 import os
 import sys
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# --- Config ---
-NETFILE_API = "https://netfile.com/Connect2/api/public/list/filing"
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 SEEN_FILE = "seen_filings.json"
-LOBBYIST_PUB_URL = "https://netfile.com/lobbyistpub/#/sfo/directory/filings"
-
-PAGE_SIZE = 50
+TARGET_URL = "https://netfile.com/lobbyistpub/#/sfo/directory/filings"
+LOBBYIST_PUB_URL = TARGET_URL
 
 
 def load_seen() -> set:
@@ -34,45 +32,77 @@ def save_seen(seen: set):
     Path(SEEN_FILE).write_text(json.dumps(sorted(seen), indent=2))
 
 
-def fetch_filings() -> list[dict]:
-    """Fetch the most recent SFO lobbyist filings from the NetFile public API."""
-    payload = {
-        "aid": "SFO",
-        "application": "Lobbyist",
-        "currentPageIndex": 0,
-        "pageSize": PAGE_SIZE,
-    }
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "netfile-discord-bot/1.0",
-    }
-    resp = requests.post(NETFILE_API, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("filings", [])
+def filing_hash(f: dict) -> str:
+    raw = json.dumps(f, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def scrape_filings() -> list[dict]:
+    """Launch a headless browser, load the filings page, and extract rows."""
+    filings = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        print(f"  Loading {TARGET_URL} ...")
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+
+        # Wait for the filings table to appear
+        try:
+            page.wait_for_selector("table tbody tr, .filing-row, [class*='filing']", timeout=30000)
+        except PlaywrightTimeout:
+            # Try waiting a bit longer for the SPA to hydrate
+            page.wait_for_timeout(5000)
+
+        # Dump page content for debugging
+        content = page.content()
+        print(f"  Page content length: {len(content)} chars")
+
+        # Try to extract table rows
+        rows = page.query_selector_all("table tbody tr")
+        print(f"  Found {len(rows)} table rows")
+
+        for row in rows:
+            cells = row.query_selector_all("td")
+            cell_texts = [c.inner_text().strip() for c in cells]
+            if cell_texts and any(cell_texts):
+                f = {"cells": cell_texts, "raw": " | ".join(cell_texts)}
+                f["id"] = filing_hash(f)
+                filings.append(f)
+
+        # If no table rows found, try other selectors
+        if not filings:
+            # Try list items or cards
+            items = page.query_selector_all("[class*='row'], [class*='item'], [class*='card'], li")
+            print(f"  Fallback: found {len(items)} items")
+            for item in items[:50]:
+                text = item.inner_text().strip()
+                if len(text) > 10:
+                    f = {"raw": text, "id": filing_hash({"raw": text})}
+                    filings.append(f)
+
+        browser.close()
+    return filings
 
 
 def format_discord_embed(f: dict) -> dict:
-    filer = f.get("filerName") or "Unknown Filer"
-    title = f.get("title") or "Untitled Filing"
-    filing_date = (f.get("filingDate") or "")[:10]
-    fid = f.get("id", "")
-    is_amendment = f.get("amendmentSequenceNumber", 0) > 0
+    cells = f.get("cells", [])
+    raw = f.get("raw", "")
 
-    lines = [f"**Filing:** {title}"]
-    if filing_date:
-        lines.append(f"**Filed:** {filing_date}")
-    if is_amendment:
-        lines.append(f"**Amendment #{f['amendmentSequenceNumber']}**")
-    lines.append(f"**ID:** `{fid}`")
-
-    filing_url = f"https://netfile.com/app/lobbyist/filing/{fid}/report" if fid else LOBBYIST_PUB_URL
+    # Try to parse common column patterns: [filer, form, date, ...]
+    if len(cells) >= 3:
+        filer = cells[0]
+        form = cells[1] if len(cells) > 1 else ""
+        date = cells[2] if len(cells) > 2 else ""
+        description = f"**Form:** {form}\n**Filed:** {date}"
+    else:
+        filer = raw[:80] if raw else "New Filing"
+        description = raw[:300] if raw else ""
 
     return {
-        "title": f"📄 New Lobbyist Filing: {filer}",
-        "description": "\n".join(lines),
-        "url": filing_url,
+        "title": f"📄 New Lobbyist Filing: {filer[:100]}",
+        "description": description,
+        "url": LOBBYIST_PUB_URL,
         "color": 0x1E88E5,
         "footer": {"text": "SF Ethics Commission · NetFile Lobbyist Portal"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -88,16 +118,17 @@ def main():
     print(f"[{datetime.now().isoformat()}] Checking NetFile SFO filings…")
 
     try:
-        filings = fetch_filings()
+        filings = scrape_filings()
     except Exception as e:
-        print(f"ERROR fetching filings: {e}", file=sys.stderr)
+        print(f"ERROR scraping filings: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
         sys.exit(1)
 
-    print(f"Fetched {len(filings)} filing(s) from API.")
+    print(f"Scraped {len(filings)} filing(s).")
 
     seen = load_seen()
-    new_filings = [(f["id"], f) for f in filings if f.get("id") and f["id"] not in seen]
-    print(f"New filing(s) since last run: {len(new_filings)}")
+    new_filings = [(f["id"], f) for f in filings if f["id"] not in seen]
+    print(f"New filing(s): {len(new_filings)}")
 
     errors = 0
     for fid, f in new_filings:
@@ -105,7 +136,7 @@ def main():
             embed = format_discord_embed(f)
             post_to_discord(embed)
             seen.add(fid)
-            print(f"  ✓ Notified: {f.get('filerName')} — {f.get('title')}")
+            print(f"  ✓ Notified: {f.get('raw', '')[:60]}")
         except Exception as e:
             print(f"  ✗ ERROR for {fid}: {e}", file=sys.stderr)
             errors += 1
